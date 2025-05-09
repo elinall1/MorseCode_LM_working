@@ -1,0 +1,280 @@
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define F_CPU 16000000UL
+#define SCL_CLOCK 100000L
+#define LCD_ADDR 0x3E
+#define DOT_THRESHOLD_MIN 200   // Lowered minimum
+#define DOT_THRESHOLD_MAX 1000   // Lowered maximum
+
+// LCD Functions
+void TWI_init(void) {
+	TWSR0 = 0x00;
+	TWBR0 = ((F_CPU / SCL_CLOCK) - 16) / 2;
+}
+
+void TWI_start(void) {
+	TWCR0 = (1 << TWSTA) | (1 << TWEN) | (1 << TWINT);
+	while (!(TWCR0 & (1 << TWINT)));
+}
+
+void TWI_stop(void) {
+	TWCR0 = (1 << TWSTO) | (1 << TWEN) | (1 << TWINT);
+	_delay_ms(1);
+}
+
+void TWI_write(uint8_t data) {
+	TWDR0 = data;
+	TWCR0 = (1 << TWEN) | (1 << TWINT);
+	while (!(TWCR0 & (1 << TWINT)));
+}
+
+void LCD_sendCommand(uint8_t cmd) {
+	TWI_start();
+	TWI_write(LCD_ADDR << 1);
+	TWI_write(0x80);
+	TWI_write(cmd);
+	TWI_stop();
+}
+
+void LCD_sendData(uint8_t data) {
+	TWI_start();
+	TWI_write(LCD_ADDR << 1);
+	TWI_write(0x40);
+	TWI_write(data);
+	TWI_stop();
+}
+
+void LCD_init(void) {
+	_delay_ms(50);
+	LCD_sendCommand(0x38);
+	LCD_sendCommand(0x39);
+	LCD_sendCommand(0x14);
+	LCD_sendCommand(0x70);
+	LCD_sendCommand(0x56);
+	LCD_sendCommand(0x6C);
+	_delay_ms(200);
+	LCD_sendCommand(0x38);
+	LCD_sendCommand(0x0C);
+	LCD_sendCommand(0x01);
+	_delay_ms(10);
+}
+
+void LCD_setCursor(uint8_t col, uint8_t row) {
+	uint8_t address = (row == 0) ? col : (0x40 + col);
+	LCD_sendCommand(0x80 | address);
+}
+
+void LCD_print(const char *str) {
+	while (*str) {
+		LCD_sendData(*str++);
+	}
+}
+
+// Globals
+volatile uint32_t press_time = 0;
+volatile uint8_t button_pressed = 0;
+volatile uint32_t millis = 0;
+volatile uint32_t last_input_time = 0;
+char morse_input[10];
+uint8_t morse_index = 0;
+
+// Pin Definitions
+#define BUTTON_PIN PD2
+#define BUZZER_PIN PD3
+#define LED_PIN PD4
+#define MODE_SWITCH_PIN PD5
+#define POT_ADC_CHANNEL 0
+
+void ADC_init() {
+	ADMUX = (1 << REFS0) | POT_ADC_CHANNEL;
+	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1);
+}
+
+uint16_t read_ADC() {
+	ADCSRA |= (1 << ADSC);
+	while (ADCSRA & (1 << ADSC));
+	return ADC;
+}
+
+uint16_t get_dot_threshold() {
+	uint16_t adc = read_ADC();
+	return DOT_THRESHOLD_MIN + (adc * (DOT_THRESHOLD_MAX - DOT_THRESHOLD_MIN) / 1023);
+}
+
+void variable_delay_ms(uint16_t duration) {
+	while (duration--) {
+		_delay_ms(1);
+	}
+}
+
+void play_tone(uint16_t duration) {
+	PORTD |= (1 << BUZZER_PIN);
+	PORTD |= (1 << LED_PIN);
+	variable_delay_ms(duration);
+	PORTD &= ~(1 << BUZZER_PIN);
+	PORTD &= ~(1 << LED_PIN);
+}
+
+ISR(INT0_vect) {
+	static uint32_t last_interrupt_time = 0;  // Variable to store the time of the last interrupt
+
+	// Debouncing: Only register button press if enough time has passed since the last interrupt
+	if (millis - last_interrupt_time > 50) { // 50ms debounce time
+		if (!button_pressed) {
+			button_pressed = 1;
+			press_time = 0;
+			} else {
+			button_pressed = 0;
+			uint16_t dot_thresh = get_dot_threshold();
+			if (morse_index < sizeof(morse_input) - 1) {
+				if (press_time < dot_thresh) {
+					morse_input[morse_index++] = '.';
+					play_tone(100);
+					} else {
+					morse_input[morse_index++] = '-';
+					play_tone(300);
+				}
+			}
+			last_input_time = millis;
+		}
+
+		last_interrupt_time = millis;  // Update the time of the last interrupt
+	}
+}
+
+ISR(TIMER0_COMPA_vect) {
+	millis++;
+	
+	if (button_pressed) {
+		press_time++;
+		PORTD |= (1 << BUZZER_PIN); // Keep buzzer on while the button is pressed
+		PORTD |= (1 << LED_PIN);    // Turn on LED while button is pressed
+		} else {
+		PORTD &= ~(1 << BUZZER_PIN); // Turn off buzzer when button is not pressed
+		PORTD &= ~(1 << LED_PIN);    // Turn off LED when button is not pressed
+	}
+}
+
+void init_IO() {
+	// Configure buzzer and LED as outputs
+	DDRD |= (1 << BUZZER_PIN) | (1 << LED_PIN);
+	
+	// Configure button as input and enable pull-up resistor
+	DDRD &= ~(1 << BUTTON_PIN);          // Set PD2 as input
+	PORTD |= (1 << BUTTON_PIN);          // Enable pull-up resistor on PD2
+	
+	DDRD &= ~(1 << MODE_SWITCH_PIN);     // Set MODE_SWITCH_PIN as input
+
+	// External Interrupt Setup (INT0)
+	EICRA |= (1 << ISC00);  // Trigger INT0 on any edge (rising/falling)
+	EIMSK |= (1 << INT0);   // Enable INT0 interrupt
+
+	// Timer0 setup for millisecond tracking
+	TCCR0A = (1 << WGM01);      // Set timer to CTC mode
+	OCR0A = 249;                // Compare match value for 1ms interval
+	TCCR0B = (1 << CS01) | (1 << CS00);  // Start timer with prescaler of 64
+	TIMSK0 = (1 << OCIE0A);     // Enable interrupt on compare match
+
+	sei();  // Enable global interrupts
+}
+
+const char* morse_decode(const char* code) {
+	if (strcmp(code, ".-") == 0) return "A";
+	if (strcmp(code, "-...") == 0) return "B";
+	if (strcmp(code, "-.-.") == 0) return "C";
+	if (strcmp(code, "-..") == 0) return "D";
+	if (strcmp(code, ".") == 0) return "E";
+	if (strcmp(code, "..-.") == 0) return "F";
+	if (strcmp(code, "--.") == 0) return "G";
+	if (strcmp(code, "....") == 0) return "H";
+	if (strcmp(code, "..") == 0) return "I";
+	if (strcmp(code, ".---") == 0) return "J";
+	if (strcmp(code, "-.-") == 0) return "K";
+	if (strcmp(code, ".-..") == 0) return "L";
+	if (strcmp(code, "--") == 0) return "M";
+	if (strcmp(code, "-.") == 0) return "N";
+	if (strcmp(code, "---") == 0) return "O";
+	if (strcmp(code, ".--.") == 0) return "P";
+	if (strcmp(code, "--.-") == 0) return "Q";
+	if (strcmp(code, ".-.") == 0) return "R";
+	if (strcmp(code, "...") == 0) return "S";
+	if (strcmp(code, "-") == 0) return "T";
+	if (strcmp(code, "..-") == 0) return "U";
+	if (strcmp(code, "...-") == 0) return "V";
+	if (strcmp(code, ".--") == 0) return "W";
+	if (strcmp(code, "-..-") == 0) return "X";
+	if (strcmp(code, "-.--") == 0) return "Y";
+	if (strcmp(code, "--..") == 0) return "Z";
+	return "?";
+}
+
+void basic_learning_mode() {
+	LCD_setCursor(0, 0);
+	LCD_print("Learning Mode   ");
+	static uint32_t last_decoded_time = 0;
+
+	if (morse_index > 0 && (millis - last_input_time) >= 2000) {
+		morse_input[morse_index] = '\0';
+		const char* decoded = morse_decode(morse_input);
+		LCD_setCursor(0, 1);
+		LCD_print(decoded);
+		morse_index = 0;
+		last_decoded_time = millis;
+		} else if (morse_index == 0 && (millis - last_decoded_time) >= 1000) {
+		LCD_setCursor(0, 1);
+		LCD_print("                ");
+	}
+}
+
+void practice_mode() {
+	static uint8_t initialized = 0;
+	static char current_challenge = 'A';
+	if (!initialized) {
+		LCD_setCursor(0, 0);
+		LCD_print("Practice Mode   ");
+		current_challenge = 'A' + (rand() % 26);
+		LCD_setCursor(0, 1);
+		char msg[2] = {current_challenge, '\0'};
+		LCD_print(msg);
+		initialized = 1;
+		last_input_time = millis;
+		morse_index = 0;
+	}
+
+	if ((millis - last_input_time) >= 4000 && morse_index > 0) {
+		morse_input[morse_index] = '\0';
+		const char* decoded = morse_decode(morse_input);
+		LCD_setCursor(0, 1);
+		if (decoded[0] == current_challenge) {
+			LCD_print("Good Job!       ");
+			variable_delay_ms(2000);
+			initialized = 0; // Generate new challenge
+			} else {
+			LCD_print("Try Again       ");
+			variable_delay_ms(2000);
+			LCD_setCursor(0, 1);
+			char msg[2] = {current_challenge, '\0'};
+			LCD_print(msg);
+		}
+		morse_index = 0;
+	}
+}
+
+int main(void) {
+	TWI_init();
+	LCD_init();
+	ADC_init();
+	init_IO();
+
+	while (1) {
+		if (PIND & (1 << MODE_SWITCH_PIN)) {
+			practice_mode();
+			} else {
+			basic_learning_mode();
+		}
+	}
+}
